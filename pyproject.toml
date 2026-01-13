@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "owrf1d"
-version = "0.0.0"
-description = "Online Window Regression Filter 1D (skeleton)"
+version = "1.0.0"
+description = "Online Window Regression Filter 1D (parameterless)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["cloudpickle>=2.2"]
