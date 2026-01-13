@@ -26,15 +26,14 @@ _TIE_TOL = 1e-12
 # Gentle prior to prefer larger windows in stationary regimes.
 _WINDOW_PRIOR_WEIGHT = 0.5
 
-# Soft selection: adaptive temperature bounds (no public params)
-_TAU_MIN = 2
+# Soft selection internals (no public parameters)
+_TAU_MIN = 2.0
 _TAU_MAX = 3.0
-_TAU_BOOT = 2.0  # first-pass tau used to estimate entropy, then recompute with tau_t
+_TAU_BOOT = 2.0
 
-# Soft selection: adaptive search cap settings (no public params)
 _CAP_R_MIN = 0.7
 _CAP_R_MAX = 3.0
-_CAP_BETA = 0.01  # EWMA update rate for cap
+_CAP_BETA = 0.01
 
 try:
     from ._core import select_student_t as _cy_select_student_t  # type: ignore

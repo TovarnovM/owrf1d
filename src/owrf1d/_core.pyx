@@ -1,12 +1,26 @@
 # cython: language_level=3
 # cython: boundscheck=False, wraparound=False, initializedcheck=False, cdivision=True
 
+import array as pyarray
 from libc.math cimport log, lgamma, isfinite, fabs
 cimport cython
 
 cdef double _EPS = 1e-12
 cdef double _TIE_TOL = 1e-12
 cdef double _WINDOW_PRIOR_WEIGHT = 0.5
+
+# Packed layout: STRIDE=10 doubles per candidate
+# [0]=k
+# [1]=score
+# [2]=pred_mu
+# [3]=pred_s2
+# [4]=sx
+# [5]=sxx
+# [6]=sy
+# [7]=sxy
+# [8]=syy
+# [9]=flags_k  (stored as double; cast to int on Python side)
+cdef int _STRIDE = 10
 
 # IMPORTANT: must match src/owrf1d/flags.py
 cdef int FLAG_DEGENERATE_XTX = 1 << 2
@@ -19,10 +33,6 @@ cdef inline int _finite(double x) nogil:
 
 
 cdef inline int _wrap_idx(int idx, int cap) nogil:
-    """
-    Python-style wrap for ring-buffer indices, but in C semantics.
-    Assumption in our loops: idx in [-(cap-1), cap-1], so one +cap is enough.
-    """
     if idx < 0:
         idx += cap
     elif idx >= cap:
@@ -116,23 +126,17 @@ cpdef select_student_t(
     """
     Selection phase (pre): choose n* by maximizing predictive Student-t log-likelihood.
 
-    Buffer semantics:
-      - ring buffer arrays t_buf / y_buf of identical length (cap)
-      - 'head' is next write position
-      - 'size' is number of valid items (<= cap)
-      - current y_t is NOT in buffers yet (strict online)
-
     Returns:
-      (n_star, score_star, score_second, pred_mu_star, pred_s2_star, nu, flags, candidates)
+      (n_star, score_star, score_second, pred_mu_star, pred_s2_star, nu, flags, K, packed)
 
-    candidates: list of tuples
-      (k, score, pred_mu, pred_s2, sx, sxx, sy, sxy, syy, flags_k)
-      only when collect_candidates is True, else [].
+    packed: array('d') with STRIDE=10 per candidate, only when collect_candidates=True, else empty.
+    K: number of candidates packed.
     """
     cdef int flags = 0
     cdef int cap = t_buf.shape[0]
     cdef int n_avail = size
     cdef int n_max = max_window_effective
+
     cdef int k, idx_raw, idx
     cdef double x_origin, t_i, y_i, x_i
     cdef double sx = 0.0
@@ -157,15 +161,31 @@ cpdef select_student_t(
     cdef int nu
     cdef double pred_mu, pred_s2, h_t, e, score
 
-    cdef object candidates = []
+    cdef object packed
+    cdef double[:] pview
+    cdef int max_cands = 0
+    cdef int m = 0
+    cdef int base
+
     if n_max > n_avail:
         n_max = n_avail
     if n_max < min_window:
-        return 0, 0.0, 0.0, 0.0, _EPS, 0, 0, candidates
+        packed = pyarray.array("d")
+        return 0, 0.0, 0.0, 0.0, _EPS, 0, 0, 0, packed
 
     if (not _finite(d)) or d <= 0.0:
         flags |= FLAG_NUMERIC_GUARD
         d = 1.0
+
+    # allocate packed for candidates if needed (upper bound)
+    if collect_candidates:
+        max_cands = n_max - min_window + 1
+        if max_cands < 0:
+            max_cands = 0
+        packed = pyarray.array("d", [0.0]) * (max_cands * _STRIDE)
+        pview = packed
+    else:
+        packed = pyarray.array("d")
 
     # last prior timestamp index = head-1 (Python wrap, not C %)
     idx_raw = head - 1
@@ -176,7 +196,6 @@ cpdef select_student_t(
         x_origin = 0.0
 
     for k in range(1, n_max + 1):
-        # idx = (head - k) mod cap in Python sense
         idx_raw = head - k
         idx = _wrap_idx(idx_raw, cap)
 
@@ -220,7 +239,18 @@ cpdef select_student_t(
         score = _student_t_loglik(e, pred_s2, nu) + _WINDOW_PRIOR_WEIGHT * log(<double>k)
 
         if collect_candidates:
-            candidates.append((k, score, pred_mu, pred_s2, sx, sxx, sy, sxy, syy, f_ols))
+            base = m * _STRIDE
+            pview[base + 0] = <double>k
+            pview[base + 1] = score
+            pview[base + 2] = pred_mu
+            pview[base + 3] = pred_s2
+            pview[base + 4] = sx
+            pview[base + 5] = sxx
+            pview[base + 6] = sy
+            pview[base + 7] = sxy
+            pview[base + 8] = syy
+            pview[base + 9] = <double>f_ols
+            m += 1
 
         if (score > best_score + _TIE_TOL) or (fabs(score - best_score) <= _TIE_TOL and k > best_n):
             best_second = best_score
@@ -236,10 +266,18 @@ cpdef select_student_t(
     if not any_valid:
         if any_degenerate:
             flags |= FLAG_DEGENERATE_XTX
-        return 0, 0.0, 0.0, 0.0, _EPS, 0, flags, candidates
+        if collect_candidates and max_cands > 0:
+            del packed[:]  # empty
+        return 0, 0.0, 0.0, 0.0, _EPS, 0, flags, 0, packed
 
     flags |= best_flags
     if best_second <= -1e299:
         best_second = best_score
 
-    return best_n, best_score, best_second, best_pred_mu, best_pred_s2, best_nu, flags, candidates
+    if collect_candidates:
+        # shrink to actual length
+        if max_cands > 0 and m < max_cands:
+            del packed[m * _STRIDE :]
+        return best_n, best_score, best_second, best_pred_mu, best_pred_s2, best_nu, flags, m, packed
+
+    return best_n, best_score, best_second, best_pred_mu, best_pred_s2, best_nu, flags, 0, packed

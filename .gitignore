@@ -4,3 +4,4 @@
 *.so
 *.pytest_cache
 *.vscode
+*.patch
