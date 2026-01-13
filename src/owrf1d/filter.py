@@ -17,28 +17,37 @@ from .flags import (
     FLAG_HISTORY_TRUNC,
 )
 
-# -------------------------
-# Numeric guards / constants
-# -------------------------
 _EPS = 1e-12
 _TIE_TOL = 1e-12
-
-# Gentle prior to prefer larger windows in stationary regimes.
 _WINDOW_PRIOR_WEIGHT = 0.5
 
-# Soft selection internals (no public parameters)
+# Soft selection internals (kept for Python fallback only)
 _TAU_MIN = 2.0
 _TAU_MAX = 3.0
 _TAU_BOOT = 2.0
-
 _CAP_R_MIN = 0.7
 _CAP_R_MAX = 3.0
-_CAP_BETA = 0.01
+_CAP_BETA = 0.010
+
+# Packed candidates layout (must match src/owrf1d/_core.pyx)
+_PACK_STRIDE = 10
+_P_K = 0
+_P_SCORE = 1
+_P_PRED_MU = 2
+_P_PRED_S2 = 3
+_P_SX = 4
+_P_SXX = 5
+_P_SY = 6
+_P_SXY = 7
+_P_SYY = 8
+_P_FLAGS = 9
 
 try:
     from ._core import select_student_t as _cy_select_student_t  # type: ignore
+    from ._core import soft_step_from_packed as _cy_soft_step_from_packed  # type: ignore
 except Exception:  # pragma: no cover
     _cy_select_student_t = None
+    _cy_soft_step_from_packed = None
 
 HAVE_CYTHON_CORE: bool = _cy_select_student_t is not None
 
@@ -58,12 +67,6 @@ def _finite(x: float) -> bool:
 
 
 class _RingBufferD:
-    """Fixed-size ring buffer for doubles (contiguous array('d')).
-
-    head: index of next write position
-    size: number of valid items (<= cap)
-    """
-
     __slots__ = ("cap", "buf", "head", "size")
 
     def __init__(self, cap: int) -> None:
@@ -85,21 +88,7 @@ class _RingBufferD:
             raise IndexError("empty")
         return float(self.buf[(self.head - 1) % self.cap])
 
-    def get_last_n(self, n: int) -> List[float]:
-        """Return last n values in chronological order (oldest..newest)."""
-        n = int(n)
-        if n <= 0:
-            return []
-        if n > self.size:
-            n = self.size
-        start = (self.head - n) % self.cap
-        out: List[float] = []
-        for i in range(n):
-            out.append(float(self.buf[(start + i) % self.cap]))
-        return out
-
     def get_last_n_pair(self, other: "_RingBufferD", n: int) -> Tuple[List[float], List[float]]:
-        """Return last n pairs (self, other) in chronological order."""
         if self.cap != other.cap:
             raise ValueError("cap mismatch")
         n = int(n)
@@ -122,7 +111,6 @@ class _RingBufferD:
 def _ols_from_sums(
     n: int, sx: float, sxx: float, sy: float, sxy: float, syy: float
 ) -> Tuple[float, float, float, float, int]:
-    """Return (a, b, sigma2, D, flags_delta) using OLS with numeric guards."""
     flags = 0
     if n <= 0:
         return 0.0, 0.0, 1.0, 0.0, FLAG_NUMERIC_GUARD
@@ -213,11 +201,6 @@ def _post_params_from_pre_sums(
     sxy: float,
     syy: float,
 ) -> Tuple[float, float, float, int]:
-    """Compute post OLS on N=k+1 points using O(1) transform of pre-sums.
-
-    Pre coordinate: x_i = T_i - T_{t-1}, current point has x_t = d
-    Post coordinate: x_i_post = T_i - T_t = x_i - d, current point x_t_post = 0
-    """
     if k <= 0:
         return 0.0, 0.0, _EPS, FLAG_NUMERIC_GUARD
 
@@ -246,15 +229,14 @@ def _py_select_student_t_from_ring(
     min_window: int,
     max_window_effective: int,
     collect_candidates: bool,
-) -> Tuple[int, float, float, float, float, int, int, List[Tuple[int, float, float, float, float, float, float, float, float, int]]]:
-    """Pure-Python reference selection working directly on the ring buffers."""
+) -> Tuple[int, float, float, float, float, int, int, int, array]:
     flags = 0
-    candidates: List[Tuple[int, float, float, float, float, float, float, float, float, int]] = []
+    packed_list: List[float] = []
 
     n_avail = y_buf.size
     n_max = min(max_window_effective, n_avail)
     if n_max < min_window:
-        return 0, 0.0, 0.0, 0.0, _EPS, 0, flags, candidates
+        return 0, 0.0, 0.0, 0.0, _EPS, 0, flags, 0, array("d")
 
     x_origin = t_buf.last()
     d_f = float(d)
@@ -319,9 +301,9 @@ def _py_select_student_t_from_ring(
         score = _student_t_loglik(e=e, s2=pred_s2, nu=nu) + _WINDOW_PRIOR_WEIGHT * math.log(float(k))
 
         if collect_candidates:
-            candidates.append(
-                (
-                    int(k),
+            packed_list.extend(
+                [
+                    float(k),
                     float(score),
                     float(pred_mu),
                     float(pred_s2),
@@ -330,8 +312,8 @@ def _py_select_student_t_from_ring(
                     float(sy),
                     float(sxy),
                     float(syy),
-                    int(f_ols),
-                )
+                    float(int(f_ols)),
+                ]
             )
 
         if (score > best_score + _TIE_TOL) or (abs(score - best_score) <= _TIE_TOL and k > best_n):
@@ -348,11 +330,14 @@ def _py_select_student_t_from_ring(
     if not any_valid:
         if any_degenerate:
             flags |= FLAG_DEGENERATE_XTX
-        return 0, 0.0, 0.0, 0.0, _EPS, 0, flags, candidates
+        return 0, 0.0, 0.0, 0.0, _EPS, 0, flags, 0, array("d")
 
     flags |= best_flags
     if best_second <= -1e299:
         best_second = best_score
+
+    packed = array("d", packed_list) if collect_candidates else array("d")
+    K = (len(packed) // _PACK_STRIDE) if collect_candidates else 0
 
     return (
         int(best_n),
@@ -362,7 +347,8 @@ def _py_select_student_t_from_ring(
         float(best_pred_s2),
         int(best_nu),
         int(flags),
-        candidates,
+        int(K),
+        packed,
     )
 
 
@@ -373,7 +359,7 @@ class OnlineWindowRegressor1D:
         max_window: int = 256,
         min_window: int = 4,
         history: int = 0,
-        selection: str = "hard",  # "hard" (default) or "soft"
+        selection: str = "hard",
     ) -> None:
         if max_window < 1:
             raise ValueError("max_window must be >= 1")
@@ -396,10 +382,7 @@ class OnlineWindowRegressor1D:
         self._state = _State()
         self._hist: Deque[Dict[str, Any]] = deque(maxlen=None if self.history == -1 else self.history)
 
-        # soft-only adaptive cap
         self._soft_cap: int = int(self.max_window)
-
-        # internal toggle for tests / debugging (not public API)
         self._use_core: bool = HAVE_CYTHON_CORE and (os.getenv("OWRF1D_FORCE_PY", "0") != "1")
 
     def get_state(self) -> Dict[str, Any]:
@@ -430,14 +413,13 @@ class OnlineWindowRegressor1D:
         if self.history == 0:
             return
         if self.history > 0 and len(self._hist) == self._hist.maxlen:
-            # deque will auto-drop; annotate in step for observability
             step["flags"] = int(step.get("flags", 0)) | FLAG_HISTORY_TRUNC
         self._hist.append(step)
 
     def _advance_time(self, *, t: Optional[float], dt: Optional[float]) -> Tuple[float, float, int]:
         flags = 0
         if dt is not None and t is not None:
-            flags |= FLAG_NUMERIC_GUARD  # deterministic rule: dt wins
+            flags |= FLAG_NUMERIC_GUARD  # deterministic: dt wins
 
         if dt is not None:
             dt_f = float(dt)
@@ -507,7 +489,6 @@ class OnlineWindowRegressor1D:
             flags |= FLAG_NUMERIC_GUARD
             y_f = 0.0
 
-        # d_used: actual time delta from last observed timestamp, if available
         d_used = float(dt_now)
         if self._t_buf.size > 0:
             dt_obs = float(t_now) - self._t_buf.last()
@@ -517,7 +498,6 @@ class OnlineWindowRegressor1D:
             flags |= FLAG_NUMERIC_GUARD
             d_used = 1.0
 
-        # Defaults
         pred_mu = self._state.mu + self._state.trend * d_used
         pred_s2 = max(self._state.sigma2, _EPS)
         score_star = 0.0
@@ -525,7 +505,6 @@ class OnlineWindowRegressor1D:
         nu_sel = 0
         n_hard = 0
 
-        # soft diagnostics
         n_eff = 0.0
         tau_t = 0.0
         cap_before = int(self._soft_cap)
@@ -534,7 +513,15 @@ class OnlineWindowRegressor1D:
         w_star = 0.0
         ent = 0.0
 
-        candidates: List[Tuple[int, float, float, float, float, float, float, float, float, int]] = []
+        K = 0
+        packed = array("d")
+
+        used_core_soft = False
+        mu_post = float(y_f)
+        trend_post = 0.0
+        sigma2_post = float(max(self._state.sigma2, _EPS))
+        sigma2_total = float(max(self._state.sigma2, _EPS))
+        n_final = 0
 
         n_avail = self._y_buf.size
         if n_avail < self.min_window:
@@ -545,7 +532,7 @@ class OnlineWindowRegressor1D:
                 max_eff = min(self.max_window, max(self.min_window, int(self._soft_cap)))
 
             if self._use_core and HAVE_CYTHON_CORE:
-                (n_hard, score_star, score_second, pred_mu_star, pred_s2_star, nu_sel, f_sel, candidates) = _cy_select_student_t(
+                (n_hard, score_star, score_second, pred_mu_star, pred_s2_star, nu_sel, f_sel, K, packed) = _cy_select_student_t(
                     self._t_buf.view(),
                     self._y_buf.view(),
                     int(self._t_buf.head),
@@ -557,7 +544,7 @@ class OnlineWindowRegressor1D:
                     bool(self.selection == "soft"),
                 )
             else:
-                (n_hard, score_star, score_second, pred_mu_star, pred_s2_star, nu_sel, f_sel, candidates) = _py_select_student_t_from_ring(
+                (n_hard, score_star, score_second, pred_mu_star, pred_s2_star, nu_sel, f_sel, K, packed) = _py_select_student_t_from_ring(
                     t_buf=self._t_buf,
                     y_buf=self._y_buf,
                     y_t=y_f,
@@ -575,55 +562,85 @@ class OnlineWindowRegressor1D:
                     pred_s2 = float(pred_s2_star)
                     n_eff = float(n_hard)
                 else:
-                    # Soft mode: adaptive tau via entropy, plus adaptive cap update for next step.
-                    if candidates:
-                        log_scores = [c[1] for c in candidates]
-                        ws0, _, ent0 = _softmax_weights(log_scores, tau=_TAU_BOOT)
-                        h0 = _entropy_norm(ent0, len(ws0)) if ws0 else 0.0
-                        tau_t = _TAU_MIN + (_TAU_MAX - _TAU_MIN) * h0
+                    # Preferred: full soft path in Cython (no Python loops on candidates)
+                    if (
+                        self._use_core
+                        and (_cy_soft_step_from_packed is not None)
+                        and K > 0
+                    ):
+                        (
+                            pred_mu,
+                            pred_s2,
+                            n_eff,
+                            tau_t,
+                            w_star,
+                            ent,
+                            h_norm,
+                            cap_target,
+                            cap_new,
+                            mu_post,
+                            trend_post,
+                            sigma2_post,
+                            sigma2_total,
+                            f_add,
+                            n_final,
+                        ) = _cy_soft_step_from_packed(
+                            packed,
+                            int(K),
+                            float(d_used),
+                            float(y_f),
+                            int(self._soft_cap),
+                            int(self.max_window),
+                            int(self.min_window),
+                        )
+                        flags |= int(f_add)
+                        self._soft_cap = int(cap_new)
+                        used_core_soft = True
+                    else:
+                        # Python fallback
+                        if K > 0:
+                            log_scores = [packed[i * _PACK_STRIDE + _P_SCORE] for i in range(K)]
+                            ws0, _, ent0 = _softmax_weights(log_scores, tau=_TAU_BOOT)
+                            h0 = _entropy_norm(ent0, len(ws0)) if ws0 else 0.0
+                            tau_t = _TAU_MIN + (_TAU_MAX - _TAU_MIN) * h0
 
-                        ws, w_star, ent = _softmax_weights(log_scores, tau=tau_t)
-                        h_norm = _entropy_norm(ent, len(ws)) if ws else 0.0
+                            ws, w_star, ent = _softmax_weights(log_scores, tau=tau_t)
+                            h_norm = _entropy_norm(ent, len(ws)) if ws else 0.0
 
-                        if ws:
-                            pred_mu = 0.0
-                            for w, c in zip(ws, candidates, strict=True):
-                                pred_mu += w * c[2]
-                            pred_s2 = 0.0
-                            for w, c in zip(ws, candidates, strict=True):
-                                dm = c[2] - pred_mu
-                                pred_s2 += w * (c[3] + dm * dm)
-                            pred_s2 = float(max(pred_s2, _EPS))
+                            if ws:
+                                pred_mu = 0.0
+                                for i, w in enumerate(ws):
+                                    pred_mu += w * packed[i * _PACK_STRIDE + _P_PRED_MU]
+                                pred_s2 = 0.0
+                                for i, w in enumerate(ws):
+                                    mu_i = packed[i * _PACK_STRIDE + _P_PRED_MU]
+                                    dm = mu_i - pred_mu
+                                    pred_s2 += w * (packed[i * _PACK_STRIDE + _P_PRED_S2] + dm * dm)
+                                pred_s2 = float(max(pred_s2, _EPS))
+                                n_eff = 0.0
+                                for i, w in enumerate(ws):
+                                    n_eff += w * packed[i * _PACK_STRIDE + _P_K]
+                            else:
+                                pred_mu = float(pred_mu_star)
+                                pred_s2 = float(pred_s2_star)
+                                n_eff = float(n_hard)
 
-                            n_eff = 0.0
-                            for w, c in zip(ws, candidates, strict=True):
-                                n_eff += w * float(c[0])
+                            r = _CAP_R_MIN + (_CAP_R_MAX - _CAP_R_MIN) * (1.0 - h_norm)
+                            cap_target = int(round(n_eff * r))
+                            cap_target = int(min(self.max_window, max(self.min_window, cap_target)))
+                            cap_new = int(round((1.0 - _CAP_BETA) * float(self._soft_cap) + _CAP_BETA * float(cap_target)))
+                            cap_new = int(min(self.max_window, max(self.min_window, cap_new)))
+                            self._soft_cap = cap_new
                         else:
                             pred_mu = float(pred_mu_star)
                             pred_s2 = float(pred_s2_star)
                             n_eff = float(n_hard)
-                            tau_t = float(_TAU_BOOT)
-                            w_star = 1.0
-                            ent = 0.0
-                            h_norm = 0.0
 
-                        r = _CAP_R_MIN + (_CAP_R_MAX - _CAP_R_MIN) * (1.0 - h_norm)
-                        cap_target = int(round(n_eff * r))
-                        cap_target = int(min(self.max_window, max(self.min_window, cap_target)))
-
-                        cap_new = int(round((1.0 - _CAP_BETA) * float(self._soft_cap) + _CAP_BETA * float(cap_target)))
-                        cap_new = int(min(self.max_window, max(self.min_window, cap_new)))
-                        self._soft_cap = cap_new
-                    else:
-                        pred_mu = float(pred_mu_star)
-                        pred_s2 = float(pred_s2_star)
-                        n_eff = float(n_hard)
-
-        # Append current point to buffers
+        # append current point
         self._t_buf.append(float(t_now))
         self._y_buf.append(float(y_f))
 
-        # Post update
+        # post update
         if self.selection == "hard":
             if n_hard > 0:
                 N = min(n_hard + 1, self._y_buf.size)
@@ -638,11 +655,11 @@ class OnlineWindowRegressor1D:
                     sxy += x * float(yi)
                     syy += float(yi) * float(yi)
 
-                a_post, b_post, sigma2_fit, _, f3 = _ols_from_sums(N, sx, sxx, sy, sxy, syy)
+                a_post2, b_post2, sigma2_fit, _, f3 = _ols_from_sums(N, sx, sxx, sy, sxy, syy)
                 flags |= int(f3)
 
-                mu_post = float(a_post)
-                trend_post = float(b_post)
+                mu_post = float(a_post2)
+                trend_post = float(b_post2)
                 sigma2_post = float(max(sigma2_fit, _EPS))
                 sigma2_total = sigma2_post
                 n_final = int(n_hard)
@@ -653,65 +670,74 @@ class OnlineWindowRegressor1D:
                 sigma2_total = sigma2_post
                 n_final = 0
         else:
-            # Soft post averaging by candidates
-            if n_avail >= self.min_window and candidates:
-                log_scores = [c[1] for c in candidates]
-                if not _finite(tau_t) or tau_t <= 0.0:
-                    ws0, _, ent0 = _softmax_weights(log_scores, tau=_TAU_BOOT)
-                    h0 = _entropy_norm(ent0, len(ws0)) if ws0 else 0.0
-                    tau_t = _TAU_MIN + (_TAU_MAX - _TAU_MIN) * h0
+            if used_core_soft:
+                # already computed in Cython
+                pass
+            else:
+                # Python soft post (fallback)
+                if n_avail >= self.min_window and K > 0:
+                    log_scores = [packed[i * _PACK_STRIDE + _P_SCORE] for i in range(K)]
+                    if not _finite(tau_t) or tau_t <= 0.0:
+                        ws0, _, ent0 = _softmax_weights(log_scores, tau=_TAU_BOOT)
+                        h0 = _entropy_norm(ent0, len(ws0)) if ws0 else 0.0
+                        tau_t = _TAU_MIN + (_TAU_MAX - _TAU_MIN) * h0
 
-                ws, w_star, ent = _softmax_weights(log_scores, tau=tau_t)
-                h_norm = _entropy_norm(ent, len(ws)) if ws else h_norm
+                    ws, w_star, ent = _softmax_weights(log_scores, tau=tau_t)
+                    h_norm = _entropy_norm(ent, len(ws)) if ws else h_norm
 
-                if ws:
-                    mu_mix = 0.0
-                    b_mix = 0.0
-                    s2_noise = 0.0
-                    mus_local: List[float] = []
+                    if ws:
+                        mu_mix = 0.0
+                        b_mix = 0.0
+                        s2_noise = 0.0
+                        mus_local: List[float] = []
 
-                    for w, c in zip(ws, candidates, strict=True):
-                        k = int(c[0])
-                        sx_k, sxx_k, sy_k, sxy_k, syy_k = c[4], c[5], c[6], c[7], c[8]
-                        a_k, b_k, s2_k, f_k = _post_params_from_pre_sums(
-                            k=k,
-                            d=d_used,
-                            y_t=y_f,
-                            sx=sx_k,
-                            sxx=sxx_k,
-                            sy=sy_k,
-                            sxy=sxy_k,
-                            syy=syy_k,
-                        )
-                        flags |= int(f_k)
-                        mu_mix += w * a_k
-                        b_mix += w * b_k
-                        s2_noise += w * s2_k
-                        mus_local.append(a_k)
+                        for i, w in enumerate(ws):
+                            base = i * _PACK_STRIDE
+                            k = int(packed[base + _P_K])
+                            sx_k = packed[base + _P_SX]
+                            sxx_k = packed[base + _P_SXX]
+                            sy_k = packed[base + _P_SY]
+                            sxy_k = packed[base + _P_SXY]
+                            syy_k = packed[base + _P_SYY]
 
-                    s2_model = 0.0
-                    for w, a_k in zip(ws, mus_local, strict=True):
-                        dm = a_k - mu_mix
-                        s2_model += w * dm * dm
+                            a_k, b_k, s2_k, f_k = _post_params_from_pre_sums(
+                                k=k,
+                                d=d_used,
+                                y_t=y_f,
+                                sx=sx_k,
+                                sxx=sxx_k,
+                                sy=sy_k,
+                                sxy=sxy_k,
+                                syy=syy_k,
+                            )
+                            flags |= int(f_k) | int(packed[base + _P_FLAGS])
+                            mu_mix += w * a_k
+                            b_mix += w * b_k
+                            s2_noise += w * s2_k
+                            mus_local.append(a_k)
 
-                    mu_post = float(mu_mix)
-                    trend_post = float(b_mix)
-                    sigma2_post = float(max(s2_noise, _EPS))
-                    sigma2_total = float(max(s2_noise + s2_model, _EPS))
+                        s2_model = 0.0
+                        for w, a_k in zip(ws, mus_local, strict=True):
+                            dm = a_k - mu_mix
+                            s2_model += w * dm * dm
 
-                    n_final = int(round(n_eff)) if n_eff > 0.0 else int(n_hard if n_hard > 0 else 0)
+                        mu_post = float(mu_mix)
+                        trend_post = float(b_mix)
+                        sigma2_post = float(max(s2_noise, _EPS))
+                        sigma2_total = float(max(s2_noise + s2_model, _EPS))
+                        n_final = int(round(n_eff)) if n_eff > 0.0 else int(n_hard if n_hard > 0 else 0)
+                    else:
+                        mu_post = float(y_f)
+                        trend_post = 0.0
+                        sigma2_post = float(max(self._state.sigma2, _EPS))
+                        sigma2_total = sigma2_post
+                        n_final = int(n_hard if n_hard > 0 else 0)
                 else:
                     mu_post = float(y_f)
                     trend_post = 0.0
                     sigma2_post = float(max(self._state.sigma2, _EPS))
                     sigma2_total = sigma2_post
-                    n_final = int(n_hard if n_hard > 0 else 0)
-            else:
-                mu_post = float(y_f)
-                trend_post = 0.0
-                sigma2_post = float(max(self._state.sigma2, _EPS))
-                sigma2_total = sigma2_post
-                n_final = 0
+                    n_final = 0
 
         if (not _finite(mu_post)) or (not _finite(trend_post)) or (not _finite(sigma2_post)):
             flags |= FLAG_NUMERIC_GUARD

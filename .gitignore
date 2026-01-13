@@ -5,3 +5,6 @@
 *.pytest_cache
 *.vscode
 *.patch
+*.html
+*.c
+*.cpp

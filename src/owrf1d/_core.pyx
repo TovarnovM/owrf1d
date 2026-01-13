@@ -2,7 +2,7 @@
 # cython: boundscheck=False, wraparound=False, initializedcheck=False, cdivision=True
 
 import array as pyarray
-from libc.math cimport log, lgamma, isfinite, fabs
+from libc.math cimport log, lgamma, isfinite, fabs, exp, floor
 cimport cython
 
 cdef double _EPS = 1e-12
@@ -281,3 +281,363 @@ cpdef select_student_t(
         return best_n, best_score, best_second, best_pred_mu, best_pred_s2, best_nu, flags, m, packed
 
     return best_n, best_score, best_second, best_pred_mu, best_pred_s2, best_nu, flags, 0, packed
+
+
+
+cpdef soft_step_from_packed(
+    object packed,
+    int K,
+    double d,
+    double y_t,
+    int soft_cap,
+    int max_window,
+    int min_window,
+):
+    """
+    Returns:
+      (pred_mu, pred_s2, n_eff, tau_t, w_star, entropy, entropy_norm,
+       cap_target, cap_new,
+       mu_post, trend_post, sigma2_noise, sigma2_total,
+       flags_add, n_final)
+    """
+    cdef double[:] p = packed
+    cdef int flags_add = 0
+
+    # constants (match Python fallback)
+    cdef double tau_min = 1.0
+    cdef double tau_max = 3.0
+    cdef double tau_boot = 2.0
+
+    cdef double r_min = 1.3
+    cdef double r_max = 3.0
+    cdef double cap_beta = 0.10
+
+    cdef int stride = 10  # packed stride
+
+    # declare ALL cdef vars up-front (Cython requirement)
+    cdef int i, base, k, fk, N, best_i, f_post
+    cdef int cap_target, cap_new, n_final
+    cdef double d_used, s, m, sumexp, tmp, w
+    cdef double ent, logK, best_score
+    cdef double h0, tau_t, h_norm, w_star
+
+    cdef double pred_mu, pred_s2, n_eff
+    cdef double Emu_pred, Emu2_pred, Evar_pred
+    cdef double Ea, Ea2, Eb, Es2
+    cdef double mu_i, s2_i
+    cdef double sx, sxx, sy, sxy, syy
+    cdef double sx_post, sxx_post, sxy_post, syN, syyN
+    cdef double a_post, b_post, s2_post, Dpost
+    cdef double s2_model, sigma2_noise, sigma2_total
+    cdef double r
+
+    # guard d
+    d_used = d
+    if (not _finite(d_used)) or d_used <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        d_used = 1.0
+
+    # trivial
+    if K <= 0:
+        return (
+            0.0, _EPS, 0.0, tau_boot, 0.0, 0.0, 0.0,
+            min_window, min_window,
+            0.0, 0.0, _EPS, _EPS,
+            flags_add, 0
+        )
+
+    logK = log(<double>K) if K > 1 else 0.0
+
+    # find best_i for hard fallback
+    best_score = -1e300
+    best_i = 0
+    for i in range(K):
+        base = i * stride
+        s = p[base + 1]  # score
+        if s > best_score:
+            best_score = s
+            best_i = i
+
+    # --------------- bootstrap softmax (tau_boot) to get entropy_norm -> tau_t
+    m = -1e300
+    for i in range(K):
+        base = i * stride
+        s = p[base + 1]
+        if s > m:
+            m = s
+
+    sumexp = 0.0
+    for i in range(K):
+        base = i * stride
+        s = p[base + 1]
+        tmp = exp((s - m) / tau_boot)
+        sumexp += tmp
+
+    if (not _finite(sumexp)) or sumexp <= 0.0:
+        # hard fallback (no cdef declarations here!)
+        base = best_i * stride
+        k = <int>p[base + 0]
+        fk = <int>p[base + 9]
+        flags_add |= fk
+
+        pred_mu = p[base + 2]
+        pred_s2 = p[base + 3]
+        if (not _finite(pred_s2)) or pred_s2 <= _EPS:
+            flags_add |= FLAG_NUMERIC_GUARD
+            pred_s2 = _EPS
+
+        sx = p[base + 4]
+        sxx = p[base + 5]
+        sy = p[base + 6]
+        sxy = p[base + 7]
+        syy = p[base + 8]
+
+        sx_post = sx - (<double>k) * d_used
+        sxx_post = sxx - 2.0 * d_used * sx + (<double>k) * d_used * d_used
+        sxy_post = sxy - d_used * sy
+        N = k + 1
+        syN = sy + y_t
+        syyN = syy + y_t * y_t
+
+        f_post = 0
+        _ols_from_sums(N, sx_post, sxx_post, syN, sxy_post, syyN, &a_post, &b_post, &s2_post, &Dpost, &f_post)
+        flags_add |= f_post
+        if (not _finite(s2_post)) or s2_post <= _EPS:
+            flags_add |= FLAG_NUMERIC_GUARD
+            s2_post = _EPS
+
+        n_eff = <double>k
+        r = r_max
+        cap_target = <int>(n_eff * r + 0.5)
+        if cap_target < min_window:
+            cap_target = min_window
+        if cap_target > max_window:
+            cap_target = max_window
+
+        cap_new = <int>(((1.0 - cap_beta) * soft_cap + cap_beta * cap_target) + 0.5)
+        if cap_new < min_window:
+            cap_new = min_window
+        if cap_new > max_window:
+            cap_new = max_window
+
+        return (
+            pred_mu, pred_s2, n_eff, tau_boot, 1.0, 0.0, 0.0,
+            cap_target, cap_new,
+            a_post, b_post, s2_post, s2_post,
+            flags_add, k
+        )
+
+    # entropy under tau_boot
+    ent = 0.0
+    for i in range(K):
+        base = i * stride
+        s = p[base + 1]
+        w = exp((s - m) / tau_boot) / sumexp
+        if w > 0.0:
+            ent -= w * log(w)
+
+    h0 = (ent / logK) if (K > 1 and logK > 0.0) else 0.0
+    if (not _finite(h0)) or h0 < 0.0:
+        h0 = 0.0
+    if h0 > 1.0:
+        h0 = 1.0
+
+    tau_t = tau_min + (tau_max - tau_min) * h0
+    if (not _finite(tau_t)) or tau_t <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        tau_t = tau_boot
+
+    # --------------- main softmax with tau_t
+    m = -1e300
+    for i in range(K):
+        base = i * stride
+        s = p[base + 1]
+        if s > m:
+            m = s
+
+    sumexp = 0.0
+    for i in range(K):
+        base = i * stride
+        s = p[base + 1]
+        tmp = exp((s - m) / tau_t)
+        sumexp += tmp
+
+    if (not _finite(sumexp)) or sumexp <= 0.0:
+        # hard fallback again
+        base = best_i * stride
+        k = <int>p[base + 0]
+        fk = <int>p[base + 9]
+        flags_add |= fk
+
+        pred_mu = p[base + 2]
+        pred_s2 = p[base + 3]
+        if (not _finite(pred_s2)) or pred_s2 <= _EPS:
+            flags_add |= FLAG_NUMERIC_GUARD
+            pred_s2 = _EPS
+
+        sx = p[base + 4]
+        sxx = p[base + 5]
+        sy = p[base + 6]
+        sxy = p[base + 7]
+        syy = p[base + 8]
+
+        sx_post = sx - (<double>k) * d_used
+        sxx_post = sxx - 2.0 * d_used * sx + (<double>k) * d_used * d_used
+        sxy_post = sxy - d_used * sy
+        N = k + 1
+        syN = sy + y_t
+        syyN = syy + y_t * y_t
+
+        f_post = 0
+        _ols_from_sums(N, sx_post, sxx_post, syN, sxy_post, syyN, &a_post, &b_post, &s2_post, &Dpost, &f_post)
+        flags_add |= f_post
+        if (not _finite(s2_post)) or s2_post <= _EPS:
+            flags_add |= FLAG_NUMERIC_GUARD
+            s2_post = _EPS
+
+        n_eff = <double>k
+        r = r_max
+        cap_target = <int>(n_eff * r + 0.5)
+        if cap_target < min_window:
+            cap_target = min_window
+        if cap_target > max_window:
+            cap_target = max_window
+
+        cap_new = <int>(((1.0 - cap_beta) * soft_cap + cap_beta * cap_target) + 0.5)
+        if cap_new < min_window:
+            cap_new = min_window
+        if cap_new > max_window:
+            cap_new = max_window
+
+        return (
+            pred_mu, pred_s2, n_eff, tau_t, 1.0, 0.0, 0.0,
+            cap_target, cap_new,
+            a_post, b_post, s2_post, s2_post,
+            flags_add, k
+        )
+
+    # --------------- single pass: weights + pred moments + post moments
+    Emu_pred = 0.0
+    Emu2_pred = 0.0
+    Evar_pred = 0.0
+    n_eff = 0.0
+
+    Ea = 0.0
+    Ea2 = 0.0
+    Eb = 0.0
+    Es2 = 0.0
+
+    ent = 0.0
+    w_star = 0.0
+
+    for i in range(K):
+        base = i * stride
+        s = p[base + 1]
+        w = exp((s - m) / tau_t) / sumexp
+        if w > w_star:
+            w_star = w
+        if w > 0.0:
+            ent -= w * log(w)
+
+        fk = <int>p[base + 9]
+        flags_add |= fk
+
+        mu_i = p[base + 2]
+        s2_i = p[base + 3]
+        if (not _finite(s2_i)) or s2_i <= _EPS:
+            flags_add |= FLAG_NUMERIC_GUARD
+            s2_i = _EPS
+
+        Emu_pred += w * mu_i
+        Emu2_pred += w * mu_i * mu_i
+        Evar_pred += w * s2_i
+
+        k = <int>p[base + 0]
+        n_eff += w * (<double>k)
+
+        sx = p[base + 4]
+        sxx = p[base + 5]
+        sy = p[base + 6]
+        sxy = p[base + 7]
+        syy = p[base + 8]
+
+        sx_post = sx - (<double>k) * d_used
+        sxx_post = sxx - 2.0 * d_used * sx + (<double>k) * d_used * d_used
+        sxy_post = sxy - d_used * sy
+
+        N = k + 1
+        syN = sy + y_t
+        syyN = syy + y_t * y_t
+
+        f_post = 0
+        _ols_from_sums(N, sx_post, sxx_post, syN, sxy_post, syyN, &a_post, &b_post, &s2_post, &Dpost, &f_post)
+        flags_add |= f_post
+
+        if (not _finite(s2_post)) or s2_post <= _EPS:
+            flags_add |= FLAG_NUMERIC_GUARD
+            s2_post = _EPS
+        if (not _finite(a_post)) or (not _finite(b_post)):
+            flags_add |= FLAG_NUMERIC_GUARD
+            if not _finite(a_post):
+                a_post = 0.0
+            if not _finite(b_post):
+                b_post = 0.0
+
+        Ea += w * a_post
+        Ea2 += w * a_post * a_post
+        Eb += w * b_post
+        Es2 += w * s2_post
+
+    h_norm = (ent / logK) if (K > 1 and logK > 0.0) else 0.0
+    if (not _finite(h_norm)) or h_norm < 0.0:
+        h_norm = 0.0
+    if h_norm > 1.0:
+        h_norm = 1.0
+
+    pred_mu = Emu_pred
+    pred_s2 = Evar_pred + (Emu2_pred - Emu_pred * Emu_pred)
+    if (not _finite(pred_s2)) or pred_s2 <= _EPS:
+        flags_add |= FLAG_NUMERIC_GUARD
+        pred_s2 = _EPS
+
+    sigma2_noise = Es2
+    if (not _finite(sigma2_noise)) or sigma2_noise <= _EPS:
+        flags_add |= FLAG_NUMERIC_GUARD
+        sigma2_noise = _EPS
+
+    s2_model = Ea2 - Ea * Ea
+    if (not _finite(s2_model)) or s2_model < 0.0:
+        if not _finite(s2_model):
+            flags_add |= FLAG_NUMERIC_GUARD
+        s2_model = 0.0
+
+    sigma2_total = sigma2_noise + s2_model
+    if (not _finite(sigma2_total)) or sigma2_total <= _EPS:
+        flags_add |= FLAG_NUMERIC_GUARD
+        sigma2_total = _EPS
+
+    r = r_min + (r_max - r_min) * (1.0 - h_norm)
+    cap_target = <int>(n_eff * r + 0.5)
+    if cap_target < min_window:
+        cap_target = min_window
+    if cap_target > max_window:
+        cap_target = max_window
+
+    cap_new = <int>(((1.0 - cap_beta) * soft_cap + cap_beta * cap_target) + 0.5)
+    if cap_new < min_window:
+        cap_new = min_window
+    if cap_new > max_window:
+        cap_new = max_window
+
+    n_final = <int>(n_eff + 0.5)
+    if n_final < 0:
+        n_final = 0
+    if n_final > max_window:
+        n_final = max_window
+
+    return (
+        pred_mu, pred_s2, n_eff, tau_t, w_star, ent, h_norm,
+        cap_target, cap_new,
+        Ea, Eb, sigma2_noise, sigma2_total,
+        flags_add, n_final
+    )

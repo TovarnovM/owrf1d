@@ -20,6 +20,7 @@ setup(
             "initializedcheck": False,
             "cdivision": True,
         },
+        annotate=True
     )
 )
 

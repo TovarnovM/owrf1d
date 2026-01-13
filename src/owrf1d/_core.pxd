@@ -14,3 +14,13 @@ cpdef select_student_t(
     int max_window_effective,
     bint collect_candidates,
 )
+
+cpdef soft_step_from_packed(
+    object packed,
+    int K,
+    double d,
+    double y_t,
+    int soft_cap,
+    int max_window,
+    int min_window,
+)
