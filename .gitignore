@@ -1,0 +1,6 @@
+.venv
+*owrf1d.egg-info
+*__pycache__
+*.so
+*.pytest_cache
+*.vscode

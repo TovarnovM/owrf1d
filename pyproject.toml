@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "Cython>=3.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "owrf1d"
+version = "0.0.0"
+description = "Online Window Regression Filter 1D (skeleton)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["cloudpickle>=2.2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4", "Cython>=3.0"]
+examples = [
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
