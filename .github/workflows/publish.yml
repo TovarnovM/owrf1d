@@ -2,50 +2,56 @@ name: Publish to PyPI
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch: {}
 
 jobs:
   build_wheels:
-    name: Build wheels (manylinux)
-    runs-on: ubuntu-latest
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
     steps:
       - uses: actions/checkout@v5
 
-      # cibuildwheel itself runs via pipx inside the action
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3.1
         env:
-          # ВАЖНО: ограничиваем версии CPython, чтобы не выпускать "случайно" cp314
+          # ВАЖНО: фиксируем поддерживаемые версии, чтобы не выпускать prerelease (cp314 и т.п.)
           CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
-          # Только x86_64 (можно расширить позже)
-          CIBW_ARCHS_LINUX: "x86_64"
-          # Опционально: отключить прогон тестов (по умолчанию их и нет)
-          # CIBW_TEST_SKIP: "*"
 
-      - uses: actions/upload-artifact@v5
+      - name: Upload wheels
+        uses: actions/upload-artifact@v5
         with:
-          name: cibw-wheels
+          name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
 
-  make_sdist:
+  build_sdist:
     name: Build sdist
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: Build sdist
-        run: pipx run build --sdist
-
-      - uses: actions/upload-artifact@v5
+      # Важно: не "3.x", чтобы случайно не поймать prerelease интерпретатор
+      - uses: actions/setup-python@v6
         with:
-          name: cibw-sdist
+          python-version: "3.12"
+
+      - run: python -m pip install -U build
+      - run: python -m build --sdist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v5
+        with:
+          name: sdist
           path: dist/*.tar.gz
 
   publish:
     name: Publish to PyPI
-    needs: [build_wheels, make_sdist]
+    needs: [build_wheels, build_sdist]
     runs-on: ubuntu-latest
 
     environment:
@@ -56,10 +62,8 @@ jobs:
       id-token: write  # обязательно для Trusted Publishing
 
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v5
         with:
-          pattern: cibw-*
           path: dist
           merge-multiple: true
 
