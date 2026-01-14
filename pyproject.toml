@@ -5,13 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "owrf1d"
 version = "1.0.0"
-description = "Online Window Regression Filter 1D (parameterless)"
+description = "Online Window Regression Filter 1D (fast-cython, parameterless)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["cloudpickle>=2.2"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.4", "Cython>=3.0"]
+dev = ["pytest>=7.0", "ruff>=0.4", "Cython>=3.0", "build", "twine"]
 examples = [
   "matplotlib>=3.8",
   "numpy>=1.26",

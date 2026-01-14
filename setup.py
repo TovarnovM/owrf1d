@@ -20,9 +20,11 @@ setup(
             "initializedcheck": False,
             "cdivision": True,
         },
-        annotate=True
+        annotate=True,
     )
 )
 
 # pip install -e ".[dev,examples]"
 # python -m pip install -v -e .
+# python -m build
+# python -m twine check dist/*

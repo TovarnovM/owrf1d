@@ -1,0 +1,29 @@
+# --- Core metadata ---
+include pyproject.toml
+include README.md
+include LICENSE
+include MANIFEST.in
+
+# --- Package sources (src-layout) ---
+recursive-include src/owrf1d *.py
+recursive-include src/owrf1d *.pyx *.pxd
+recursive-include src/owrf1d *.c *.h
+recursive-include src/owrf1d py.typed
+
+# --- Examples / tests (optional but useful for sdist) ---
+recursive-include examples *.py
+recursive-include tests *.py
+
+# --- Docs assets (used by README / docs) ---
+recursive-include docs *.png *.jpg *.jpeg *.svg *.gif
+
+# --- Hygiene ---
+global-exclude *.py[cod]
+global-exclude __pycache__
+global-exclude .DS_Store
+
+prune .venv
+prune build
+prune dist
+prune *.egg-info
+prune .pytest_cache
