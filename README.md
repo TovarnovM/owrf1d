@@ -11,7 +11,7 @@ Key properties:
 - **Fast path:** optional Cython core (auto-used when available), with a pure-Python fallback.
 - **Serialization:** `dumps()` / `loads()` via `cloudpickle`.
 
-![overview](docs/owrf1d_readme_overview.png)
+![overview](https://github.com/TovarnovM/owrf1d/raw/main/docs/owrf1d_readme_overview.png)
 
 ---
 
