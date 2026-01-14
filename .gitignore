@@ -8,3 +8,6 @@
 *.html
 *.c
 *.cpp
+build/
+dist/
+*.egg-info/

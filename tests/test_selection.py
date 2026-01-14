@@ -28,7 +28,7 @@ def _gen_piecewise_linear(
 @pytest.mark.parametrize("sigma", [0.05, 0.10])
 def test_stationary_line_prefers_large_window(sigma):
     W = 64
-    f = OnlineWindowRegressor1D(max_window=W, min_window=4, history=0)
+    f = OnlineWindowRegressor1D(max_window=W, min_window=4, history=0, selection='hard')
 
     seq = _gen_piecewise_linear(
         200, t0=10_000, a0=1.0, b1=0.1, b2=0.1, sigma=sigma, seed=1
@@ -47,7 +47,7 @@ def test_stationary_line_prefers_large_window(sigma):
 def test_slope_change_forces_window_drop_then_recover():
     W = 80
     cp = 120
-    f = OnlineWindowRegressor1D(max_window=W, min_window=4, history=0)
+    f = OnlineWindowRegressor1D(max_window=W, min_window=4, history=0, selection='hard')
 
     seq = _gen_piecewise_linear(
         260, t0=cp, a0=0.0, b1=0.05, b2=0.25, sigma=0.08, seed=2

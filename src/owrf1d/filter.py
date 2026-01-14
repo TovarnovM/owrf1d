@@ -358,10 +358,10 @@ class OnlineWindowRegressor1D:
     def __init__(
         self,
         *,
-        max_window: int = 256,
+        max_window: int = 128,
         min_window: int = 4,
         history: int = 0,
-        selection: str = "hard",
+        selection: str = "soft",
     ) -> None:
         if max_window < 1:
             raise ValueError("max_window must be >= 1")

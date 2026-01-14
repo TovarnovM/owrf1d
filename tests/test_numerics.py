@@ -9,7 +9,7 @@ from owrf1d.flags import (
 
 
 def test_repeated_timestamps_sets_degenerate_flag_but_no_crash():
-    f = OnlineWindowRegressor1D(max_window=32, min_window=4, history=0)
+    f = OnlineWindowRegressor1D(max_window=32, min_window=4, history=0, selection='hard')
 
     # Many equal timestamps => x variance collapses => D ~ 0
     for i in range(10):
@@ -24,7 +24,7 @@ def test_repeated_timestamps_sets_degenerate_flag_but_no_crash():
 
 
 def test_numeric_guards_prevent_nan_inf():
-    f = OnlineWindowRegressor1D(max_window=64, min_window=4, history=0)
+    f = OnlineWindowRegressor1D(max_window=64, min_window=4, history=0, selection='hard')
 
     # Large magnitude y and tiny dt can stress numerics
     t = 0.0
