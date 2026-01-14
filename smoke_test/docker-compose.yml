@@ -1,0 +1,17 @@
+services:
+  smoke:
+    build:
+      context: ..
+      dockerfile: smoke_test/.dockerfile
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+
+    environment:
+      # Опционально: проверить конкретную версию (например 1.0.3). Пусто -> последняя.
+      OWRF1D_VERSION: ${OWRF1D_VERSION:-}
+
+      # 1 -> требовать, чтобы установка прошла ТОЛЬКО из wheel (без sdist)
+      STRICT_WHEEL: ${STRICT_WHEEL:-0}
+
+    # Можно не задавать command, т.к. CMD уже в Dockerfile.
+    # command: ["/work/smoke_test/run_smoke.sh"]

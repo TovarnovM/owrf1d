@@ -275,6 +275,20 @@ python examples/bench.py --n 200000 --max-window 128 --repeats 5
 
 ---
 
+# RUN SMOKE
+
+```bash
+docker compose -f smoke_test/docker-compose.yml up --build --abort-on-container-exit --exit-code-from smoke
+
+```
+
+```bash
+docker-compose -f smoke_test/docker-compose.yml up --build --abort-on-container-exit --exit-code-from smoke
+
+```
+
+---
+
 ## License
 
 ```MIT License
