@@ -7,52 +7,61 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  build:
-    name: Build dists
+  build_wheels:
+    name: Build wheels (manylinux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v5
+
+      # cibuildwheel itself runs via pipx inside the action
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.3.1
+        env:
+          # ВАЖНО: ограничиваем версии CPython, чтобы не выпускать "случайно" cp314
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+          # Только x86_64 (можно расширить позже)
+          CIBW_ARCHS_LINUX: "x86_64"
+          # Опционально: отключить прогон тестов (по умолчанию их и нет)
+          # CIBW_TEST_SKIP: "*"
+
+      - uses: actions/upload-artifact@v5
         with:
-          persist-credentials: false
+          name: cibw-wheels
+          path: wheelhouse/*.whl
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+  make_sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build sdist
+        run: pipx run build --sdist
+
+      - uses: actions/upload-artifact@v5
         with:
-          python-version: "3.x"
-
-      - name: Install build frontend
-        run: python -m pip install -U build twine
-
-      - name: Build sdist and wheel
-        run: python -m build
-
-      - name: Twine check
-        run: python -m twine check dist/*
-
-      - name: Upload dist artifacts
-        uses: actions/upload-artifact@v5
-        with:
-          name: python-package-distributions
-          path: dist/
+          name: cibw-sdist
+          path: dist/*.tar.gz
 
   publish:
     name: Publish to PyPI
+    needs: [build_wheels, make_sdist]
     runs-on: ubuntu-latest
-    needs: [build]
 
     environment:
       name: pypi
       url: https://pypi.org/p/owrf1d
 
     permissions:
-      id-token: write  # mandatory for Trusted Publishing
+      id-token: write  # обязательно для Trusted Publishing
 
     steps:
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v6
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
         with:
-          name: python-package-distributions
-          path: dist/
+          pattern: cibw-*
+          path: dist
+          merge-multiple: true
 
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
