@@ -45,9 +45,11 @@ _P_FLAGS = 9
 try:
     from ._core import select_student_t as _cy_select_student_t  # type: ignore
     from ._core import soft_step_from_packed as _cy_soft_step_from_packed  # type: ignore
+    from ._core import soft_update_step as _cy_soft_update_step  # type: ignore
 except Exception:  # pragma: no cover
     _cy_select_student_t = None
     _cy_soft_step_from_packed = None
+    _cy_soft_update_step = None
 
 HAVE_CYTHON_CORE: bool = _cy_select_student_t is not None
 
@@ -563,7 +565,49 @@ class OnlineWindowRegressor1D:
                     n_eff = float(n_hard)
                 else:
                     # Preferred: full soft path in Cython (no Python loops on candidates)
-                    if (
+                    if self._use_core and (_cy_soft_update_step is not None):
+                        (
+                            n_hard,
+                            score_star,
+                            score_second,
+                            pred_mu,
+                            pred_s2,
+                            nu_sel,
+                            f_core,
+                            n_eff,
+                            tau_t,
+                            w_star,
+                            ent,
+                            h_norm,
+                            cap_target,
+                            cap_new,
+                            mu_post,
+                            trend_post,
+                            sigma2_post,
+                            sigma2_total,
+                            n_final,
+                        ) = _cy_soft_update_step(
+                            self._t_buf.view(),
+                            self._y_buf.view(),
+                            int(self._t_buf.head),
+                            int(self._t_buf.size),
+                            float(y_f),
+                            float(d_used),
+                            int(self.min_window),
+                            int(max_eff),
+                            int(self._soft_cap),
+                            int(self.max_window),
+                            float(_TAU_MIN),
+                            float(_TAU_MAX),
+                            float(_TAU_BOOT),
+                            float(_CAP_R_MIN),
+                            float(_CAP_R_MAX),
+                            float(_CAP_BETA),
+                        )
+                        flags |= int(f_core)
+                        self._soft_cap = int(cap_new)
+                        used_core_soft = True
+                    elif (
                         self._use_core
                         and (_cy_soft_step_from_packed is not None)
                         and K > 0

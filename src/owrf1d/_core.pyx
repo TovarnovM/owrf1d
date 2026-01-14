@@ -3,6 +3,7 @@
 
 import array as pyarray
 from libc.math cimport log, lgamma, isfinite, fabs, exp, floor
+from cpython.mem cimport PyMem_Malloc, PyMem_Free
 cimport cython
 
 cdef double _EPS = 1e-12
@@ -676,3 +677,490 @@ cpdef soft_step_from_packed(
         Ea, Eb, sigma2_noise, sigma2_total,
         flags_add, n_final
     )
+
+
+cpdef soft_update_step(
+    double[:] t_buf,
+    double[:] y_buf,
+    int head,
+    int size,
+    double y_t,
+    double d,
+    int min_window,
+    int max_window_effective,
+    int soft_cap,
+    int max_window,
+
+    double tau_min=2.0,
+    double tau_max=3.0,
+    double tau_boot=2.0,
+    double r_min=0.7,
+    double r_max=3.0,
+    double cap_beta=0.01,
+):
+    """
+    Fused soft path: selection + soft aggregation + post moments, without packed allocation.
+
+    Returns:
+      (n_hard, score_star, score_second, pred_mu, pred_s2, nu_sel, flags_core,
+       n_eff, tau_t, w_star, entropy, entropy_norm,
+       cap_target, cap_new,
+       mu_post, trend_post, sigma2_noise, sigma2_total,
+       n_final)
+    """
+    cdef int flags_sel = 0
+    cdef int flags_add = 0
+    cdef int cap = t_buf.shape[0]
+    cdef int n_avail = size
+    cdef int n_m                    if (
+                        self._use_core
+                        and (_cy_soft_step_from_packed is not None)
+                        and K > 0
+                    ):ax = max_window_effective
+    cdef int k, idx_raw, idx
+    cdef double x_origin, t_i, y_i, x_i
+    cdef double sx = 0.0
+    cdef double sxx = 0.0
+    cdef double sy = 0.0
+    cdef double sxy = 0.0
+    cdef double syy = 0.0
+
+    cdef int best_n = 0
+    cdef int best_nu = 0
+    cdef int best_flags = 0
+    cdef int best_i = 0
+    cdef double best_score = -1e300
+    cdef double best_second = -1e300
+
+    cdef bint any_valid = False
+    cdef bint any_degenerate = False
+
+    cdef double a, b, sigma2, D
+    cdef int f_ols, nu
+    cdef double pred_mu, pred_s2, h_t, e, score
+
+    # arrays for candidates (upper bound)
+    cdef int max_cands = 0
+    cdef int m = 0
+    cdef int* ks = NULL
+    cdef int* fks = NULL
+    cdef double* scores = NULL
+    cdef double* pred_mus = NULL
+    cdef double* pred_s2s = NULL
+    cdef double* a_posts = NULL
+    cdef double* b_posts = NULL
+    cdef double* s2_posts = NULL
+
+    # post computations
+    cdef int N, f_post
+    cdef double sx_post, sxx_post, sxy_post, syN, syyN
+    cdef double a_post, b_post, s2_post, Dpost
+    cdef double d_used, tmp
+
+    # soft accumulators
+    cdef int i
+    cdef double mscore, sumexp, w, ent, logK, h0, tau_t, h_norm, w_star
+    cdef double Emu_pred, Emu2_pred, Evar_pred, n_eff
+    cdef double Ea, Ea2, Eb, Es2
+    cdef double mu_i, s2_i
+    cdef double sigma2_noise, sigma2_total, s2_model
+    cdef double r
+    cdef int cap_target, cap_new, n_final
+
+    # ---------------- guards / trivial
+    if n_max > n_avail:
+        n_max = n_avail
+    if n_max < min_window:
+        return (
+            0, 0.0, 0.0, 0.0, _EPS, 0, 0,
+            0.0, tau_boot, 0.0, 0.0, 0.0,
+            min_window, min_window,
+            0.0, 0.0, _EPS, _EPS,
+            0
+        )
+
+    d_used = d
+    if (not _finite(d_used)) or d_used <= 0.0:
+        flags_sel |= FLAG_NUMERIC_GUARD
+        d_used = 1.0
+
+    # guard soft params (same as soft_step_from_packed)
+    if (not _finite(tau_boot)) or tau_boot <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        tau_boot = 2.0
+    if (not _finite(tau_min)) or tau_min <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        tau_min = 1.0
+    if (not _finite(tau_max)) or tau_max <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        tau_max = tau_min
+    if tau_max < tau_min:
+        tmp = tau_max
+        tau_max = tau_min
+        tau_min = tmp
+
+    if (not _finite(r_min)) or r_min <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        r_min = 1.0
+    if (not _finite(r_max)) or r_max <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        r_max = r_min
+    if r_max < r_min:
+        tmp = r_max
+        r_max = r_min
+        r_min = tmp
+
+    if (not _finite(cap_beta)):
+        flags_add |= FLAG_NUMERIC_GUARD
+        cap_beta = 0.010
+    if cap_beta < 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        cap_beta = 0.0
+    if cap_beta > 1.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        cap_beta = 1.0
+
+    # last prior timestamp index = head-1
+    idx_raw = head - 1
+    idx = _wrap_idx(idx_raw, cap)
+    x_origin = t_buf[idx]
+    if not _finite(x_origin):
+        flags_sel |= FLAG_NUMERIC_GUARD
+        x_origin = 0.0
+
+    max_cands = n_max - min_window + 1
+    if max_cands < 0:
+        max_cands = 0
+
+    if max_cands == 0:
+        return (
+            0, 0.0, 0.0, 0.0, _EPS, 0, int(flags_sel | flags_add),
+            0.0, tau_boot, 0.0, 0.0, 0.0,
+            min_window, min_window,
+            0.0, 0.0, _EPS, _EPS,
+            0
+        )
+
+    # allocate candidate buffers
+    ks = <int*>PyMem_Malloc(max_cands * sizeof(int))
+    fks = <int*>PyMem_Malloc(max_cands * sizeof(int))
+    scores = <double*>PyMem_Malloc(max_cands * sizeof(double))
+    pred_mus = <double*>PyMem_Malloc(max_cands * sizeof(double))
+    pred_s2s = <double*>PyMem_Malloc(max_cands * sizeof(double))
+    a_posts = <double*>PyMem_Malloc(max_cands * sizeof(double))
+    b_posts = <double*>PyMem_Malloc(max_cands * sizeof(double))
+    s2_posts = <double*>PyMem_Malloc(max_cands * sizeof(double))
+
+    if (ks is NULL) or (fks is NULL) or (scores is NULL) or (pred_mus is NULL) or (pred_s2s is NULL) or (a_posts is NULL) or (b_posts is NULL) or (s2_posts is NULL):
+        if ks is not NULL: PyMem_Free(ks)
+        if fks is not NULL: PyMem_Free(fks)
+        if scores is not NULL: PyMem_Free(scores)
+        if pred_mus is not NULL: PyMem_Free(pred_mus)
+        if pred_s2s is not NULL: PyMem_Free(pred_s2s)
+        if a_posts is not NULL: PyMem_Free(a_posts)
+        if b_posts is not NULL: PyMem_Free(b_posts)
+        if s2_posts is not NULL: PyMem_Free(s2_posts)
+        raise MemoryError()
+
+    try:
+        # ---------------- selection pass: compute candidates + store minimal stats + post params
+        for k in range(1, n_max + 1):
+            idx_raw = head - k
+            idx = _wrap_idx(idx_raw, cap)
+
+            t_i = t_buf[idx]
+            y_i = y_buf[idx]
+
+            x_i = t_i - x_origin
+            sx += x_i
+            sxx += x_i * x_i
+            sy += y_i
+            sxy += x_i * y_i
+            syy += y_i * y_i
+
+            if k < min_window:
+                continue
+
+            f_ols = 0
+            _ols_from_sums(k, sx, sxx, sy, sxy, syy, &a, &b, &sigma2, &D, &f_ols)
+            if (f_ols & FLAG_DEGENERATE_XTX) != 0:
+                any_degenerate = True
+                continue
+
+            nu = k - 2
+            if nu <= 0:
+                continue
+
+            any_valid = True
+
+            pred_mu = a + b * d_used
+
+            h_t = (sxx - 2.0 * sx * d_used + k * d_used * d_used) / D
+            if (not _finite(h_t)) or h_t < 0.0:
+                f_ols |= FLAG_NUMERIC_GUARD
+                h_t = 0.0
+
+            pred_s2 = sigma2 * (1.0 + h_t)
+            if (not _finite(pred_s2)) or pred_s2 <= _EPS:
+                f_ols |= FLAG_NUMERIC_GUARD
+                pred_s2 = sigma2 if sigma2 > _EPS else _EPS
+
+            e = y_t - pred_mu
+            score = _student_t_loglik(e, pred_s2, nu) + _WINDOW_PRIOR_WEIGHT * log(<double>k)
+
+            # post params for this candidate (same math as soft_step_from_packed)
+            sx_post = sx - (<double>k) * d_used
+            sxx_post = sxx - 2.0 * d_used * sx + (<double>k) * d_used * d_used
+            sxy_post = sxy - d_used * sy
+
+            N = k + 1
+            syN = sy + y_t
+            syyN = syy + y_t * y_t
+
+            f_post = 0
+            _ols_from_sums(N, sx_post, sxx_post, syN, sxy_post, syyN, &a_post, &b_post, &s2_post, &Dpost, &f_post)
+
+            if (not _finite(s2_post)) or s2_post <= _EPS:
+                f_post |= FLAG_NUMERIC_GUARD
+                s2_post = _EPS
+            if (not _finite(a_post)) or (not _finite(b_post)):
+                f_post |= FLAG_NUMERIC_GUARD
+                if not _finite(a_post): a_post = 0.0
+                if not _finite(b_post): b_post = 0.0
+
+            # store
+            ks[m] = k
+            scores[m] = score
+            pred_mus[m] = pred_mu
+            pred_s2s[m] = pred_s2
+            a_posts[m] = a_post
+            b_posts[m] = b_post
+            s2_posts[m] = s2_post
+            fks[m] = f_ols | f_post
+            m += 1
+
+            # update best selection (tie-break identical to select_student_t)
+            if (score > best_score + _TIE_TOL) or (fabs(score - best_score) <= _TIE_TOL and k > best_n):
+                best_second = best_score
+                best_score = score
+                best_n = k
+                best_nu = nu
+                best_flags = f_ols
+                best_i = m - 1
+            elif score > best_second + _TIE_TOL:
+                best_second = score
+
+        if not any_valid or m <= 0:
+            if any_degenerate:
+                flags_sel |= FLAG_DEGENERATE_XTX
+            return (
+                0, 0.0, 0.0, 0.0, _EPS, 0, int(flags_sel | flags_add),
+                0.0, tau_boot, 0.0, 0.0, 0.0,
+                min_window, min_window,
+                0.0, 0.0, _EPS, _EPS,
+                0
+            )
+
+        flags_sel |= best_flags
+        if best_second <= -1e299:
+            best_second = best_score
+
+        # ---------------- bootstrap entropy (tau_boot) -> tau_t
+        logK = log(<double>m) if m > 1 else 0.0
+        mscore = best_score  # max score among candidates
+
+        sumexp = 0.0
+        for i in range(m):
+            sumexp += exp((scores[i] - mscore) / tau_boot)
+
+        if (not _finite(sumexp)) or sumexp <= 0.0:
+            # hard fallback
+            k = ks[best_i]
+            flags_add |= fks[best_i]
+
+            pred_mu = pred_mus[best_i]
+            pred_s2 = pred_s2s[best_i]
+            if (not _finite(pred_s2)) or pred_s2 <= _EPS:
+                flags_add |= FLAG_NUMERIC_GUARD
+                pred_s2 = _EPS
+
+            n_eff = <double>k
+            tau_t = tau_boot
+            w_star = 1.0
+            ent = 0.0
+            h_norm = 0.0
+
+            r = r_max
+            cap_target = <int>(n_eff * r + 0.5)
+            if cap_target < min_window: cap_target = min_window
+            if cap_target > max_window: cap_target = max_window
+
+            cap_new = <int>(((1.0 - cap_beta) * soft_cap + cap_beta * cap_target) + 0.5)
+            if cap_new < min_window: cap_new = min_window
+            if cap_new > max_window: cap_new = max_window
+
+            return (
+                best_n, best_score, best_second,
+                pred_mu, pred_s2,
+                best_nu,
+                int(flags_sel | flags_add),
+                n_eff, tau_t, w_star, ent, h_norm,
+                cap_target, cap_new,
+                a_posts[best_i], b_posts[best_i], s2_posts[best_i], s2_posts[best_i],
+                k
+            )
+
+        ent = 0.0
+        for i in range(m):
+            w = exp((scores[i] - mscore) / tau_boot) / sumexp
+            if w > 0.0:
+                ent -= w * log(w)
+
+        h0 = (ent / logK) if (m > 1 and logK > 0.0) else 0.0
+        if (not _finite(h0)) or h0 < 0.0: h0 = 0.0
+        if h0 > 1.0: h0 = 1.0
+
+        tau_t = tau_min + (tau_max - tau_min) * h0
+        if (not _finite(tau_t)) or tau_t <= 0.0:
+            flags_add |= FLAG_NUMERIC_GUARD
+            tau_t = tau_boot
+
+        # ---------------- main softmax + moments
+        sumexp = 0.0
+        for i in range(m):
+            sumexp += exp((scores[i] - mscore) / tau_t)
+
+        if (not _finite(sumexp)) or sumexp <= 0.0:
+            # hard fallback (as in soft_step_from_packed)
+            k = ks[best_i]
+            flags_add |= fks[best_i]
+
+            pred_mu = pred_mus[best_i]
+            pred_s2 = pred_s2s[best_i]
+            if (not _finite(pred_s2)) or pred_s2 <= _EPS:
+                flags_add |= FLAG_NUMERIC_GUARD
+                pred_s2 = _EPS
+
+            n_eff = <double>k
+            w_star = 1.0
+            ent = 0.0
+            h_norm = 0.0
+
+            r = r_max
+            cap_target = <int>(n_eff * r + 0.5)
+            if cap_target < min_window: cap_target = min_window
+            if cap_target > max_window: cap_target = max_window
+
+            cap_new = <int>(((1.0 - cap_beta) * soft_cap + cap_beta * cap_target) + 0.5)
+            if cap_new < min_window: cap_new = min_window
+            if cap_new > max_window: cap_new = max_window
+
+            return (
+                best_n, best_score, best_second,
+                pred_mu, pred_s2,
+                best_nu,
+                int(flags_sel | flags_add),
+                n_eff, tau_t, w_star, ent, h_norm,
+                cap_target, cap_new,
+                a_posts[best_i], b_posts[best_i], s2_posts[best_i], s2_posts[best_i],
+                k
+            )
+
+        Emu_pred = 0.0
+        Emu2_pred = 0.0
+        Evar_pred = 0.0
+        n_eff = 0.0
+
+        Ea = 0.0
+        Ea2 = 0.0
+        Eb = 0.0
+        Es2 = 0.0
+
+        ent = 0.0
+        w_star = 0.0
+
+        for i in range(m):
+            w = exp((scores[i] - mscore) / tau_t) / sumexp
+            if w > w_star:
+                w_star = w
+            if w > 0.0:
+                ent -= w * log(w)
+
+            flags_add |= fks[i]
+
+            mu_i = pred_mus[i]
+            s2_i = pred_s2s[i]
+            if (not _finite(s2_i)) or s2_i <= _EPS:
+                flags_add |= FLAG_NUMERIC_GUARD
+                s2_i = _EPS
+
+            Emu_pred += w * mu_i
+            Emu2_pred += w * mu_i * mu_i
+            Evar_pred += w * s2_i
+
+            n_eff += w * (<double>ks[i])
+
+            Ea += w * a_posts[i]
+            Ea2 += w * a_posts[i] * a_posts[i]
+            Eb += w * b_posts[i]
+            Es2 += w * s2_posts[i]
+
+        h_norm = (ent / logK) if (m > 1 and logK > 0.0) else 0.0
+        if (not _finite(h_norm)) or h_norm < 0.0: h_norm = 0.0
+        if h_norm > 1.0: h_norm = 1.0
+
+        pred_mu = Emu_pred
+        pred_s2 = Evar_pred + (Emu2_pred - Emu_pred * Emu_pred)
+        if (not _finite(pred_s2)) or pred_s2 <= _EPS:
+            flags_add |= FLAG_NUMERIC_GUARD
+            pred_s2 = _EPS
+
+        sigma2_noise = Es2
+        if (not _finite(sigma2_noise)) or sigma2_noise <= _EPS:
+            flags_add |= FLAG_NUMERIC_GUARD
+            sigma2_noise = _EPS
+
+        s2_model = Ea2 - Ea * Ea
+        if (not _finite(s2_model)) or s2_model < 0.0:
+            if not _finite(s2_model):
+                flags_add |= FLAG_NUMERIC_GUARD
+            s2_model = 0.0
+
+        sigma2_total = sigma2_noise + s2_model
+        if (not _finite(sigma2_total)) or sigma2_total <= _EPS:
+            flags_add |= FLAG_NUMERIC_GUARD
+            sigma2_total = _EPS
+
+        r = r_min + (r_max - r_min) * (1.0 - h_norm)
+        cap_target = <int>(n_eff * r + 0.5)
+        if cap_target < min_window: cap_target = min_window
+        if cap_target > max_window: cap_target = max_window
+
+        cap_new = <int>(((1.0 - cap_beta) * soft_cap + cap_beta * cap_target) + 0.5)
+        if cap_new < min_window: cap_new = min_window
+        if cap_new > max_window: cap_new = max_window
+
+        n_final = <int>(n_eff + 0.5)
+        if n_final < 0: n_final = 0
+        if n_final > max_window: n_final = max_window
+
+        return (
+            best_n, best_score, best_second,
+            pred_mu, pred_s2,
+            best_nu,
+            int(flags_sel | flags_add),
+            n_eff, tau_t, w_star, ent, h_norm,
+            cap_target, cap_new,
+            Ea, Eb, sigma2_noise, sigma2_total,
+            n_final
+        )
+
+    finally:
+        PyMem_Free(ks)
+        PyMem_Free(fks)
+        PyMem_Free(scores)
+        PyMem_Free(pred_mus)
+        PyMem_Free(pred_s2s)
+        PyMem_Free(a_posts)
+        PyMem_Free(b_posts)
+        PyMem_Free(s2_posts)
