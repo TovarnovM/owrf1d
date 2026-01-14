@@ -292,6 +292,14 @@ cpdef soft_step_from_packed(
     int soft_cap,
     int max_window,
     int min_window,
+
+    double tau_min=2.0,
+    double tau_max=3.0,
+    double tau_boot=2.0,
+    double r_min=0.7,
+    double r_max=3.0,
+    double cap_beta=0.01,
+
 ):
     """
     Returns:
@@ -302,15 +310,6 @@ cpdef soft_step_from_packed(
     """
     cdef double[:] p = packed
     cdef int flags_add = 0
-
-    # constants (match Python fallback)
-    cdef double tau_min = 1.0
-    cdef double tau_max = 3.0
-    cdef double tau_boot = 2.0
-
-    cdef double r_min = 1.3
-    cdef double r_max = 3.0
-    cdef double cap_beta = 0.10
 
     cdef int stride = 10  # packed stride
 
@@ -336,6 +335,42 @@ cpdef soft_step_from_packed(
     if (not _finite(d_used)) or d_used <= 0.0:
         flags_add |= FLAG_NUMERIC_GUARD
         d_used = 1.0
+
+    # guard soft params (Python passes these; keep defensive for direct core calls)
+    if (not _finite(tau_boot)) or tau_boot <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        tau_boot = 2.0
+    if (not _finite(tau_min)) or tau_min <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        tau_min = 1.0
+    if (not _finite(tau_max)) or tau_max <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        tau_max = tau_min
+    if tau_max < tau_min:
+        tmp = tau_max
+        tau_max = tau_min
+        tau_min = tmp
+
+    if (not _finite(r_min)) or r_min <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        r_min = 1.0
+    if (not _finite(r_max)) or r_max <= 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        r_max = r_min
+    if r_max < r_min:
+        tmp = r_max
+        r_max = r_min
+        r_min = tmp
+
+    if (not _finite(cap_beta)):
+        flags_add |= FLAG_NUMERIC_GUARD
+        cap_beta = 0.010
+    if cap_beta < 0.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        cap_beta = 0.0
+    if cap_beta > 1.0:
+        flags_add |= FLAG_NUMERIC_GUARD
+        cap_beta = 1.0
 
     # trivial
     if K <= 0:

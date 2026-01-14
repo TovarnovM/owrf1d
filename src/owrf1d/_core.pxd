@@ -23,4 +23,10 @@ cpdef soft_step_from_packed(
     int soft_cap,
     int max_window,
     int min_window,
+    double tau_min=*,
+    double tau_max=*,
+    double tau_boot=*,
+    double r_min=*,
+    double r_max=*,
+    double cap_beta=*,
 )

@@ -592,6 +592,13 @@ class OnlineWindowRegressor1D:
                             int(self._soft_cap),
                             int(self.max_window),
                             int(self.min_window),
+
+                            float(_TAU_MIN),
+                            float(_TAU_MAX),
+                            float(_TAU_BOOT),
+                            float(_CAP_R_MIN),
+                            float(_CAP_R_MAX),
+                            float(_CAP_BETA),
                         )
                         flags |= int(f_add)
                         self._soft_cap = int(cap_new)
