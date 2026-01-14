@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "owrf1d"
-version = "1.0.2"
+version = "1.0.3"
 description = "Online Window Regression Filter 1D (fast-cython, parameterless)"
 readme = "README.md"
 license = "MIT"
