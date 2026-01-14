@@ -712,11 +712,7 @@ cpdef soft_update_step(
     cdef int flags_add = 0
     cdef int cap = t_buf.shape[0]
     cdef int n_avail = size
-    cdef int n_m                    if (
-                        self._use_core
-                        and (_cy_soft_step_from_packed is not None)
-                        and K > 0
-                    ):ax = max_window_effective
+    cdef int n_max = max_window_effective
     cdef int k, idx_raw, idx
     cdef double x_origin, t_i, y_i, x_i
     cdef double sx = 0.0
